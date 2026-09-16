@@ -219,7 +219,7 @@ func TestChatStreamSendsHeadersAndStreamTrue(t *testing.T) {
 		}, nil
 	})
 	a := &auth.Auth{AccessToken: "at", UID: "u1", EnterpriseID: "e1"}
-	rc, status, respBody, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`), "")
+	rc, status, respBody, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`), "", ChatMeta{})
 	if err != nil || status != 200 {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
@@ -227,7 +227,7 @@ func TestChatStreamSendsHeadersAndStreamTrue(t *testing.T) {
 		t.Errorf("200 response should carry nil body, got %q", respBody)
 	}
 	rc.Close()
-	if gotAuth != "Bearer at" || gotUID != "u1" || gotProduct != "SaaS" {
+	if gotAuth != "Bearer at" || gotUID != "u1" || gotProduct != "WorkBuddy" {
 		t.Errorf("headers: auth=%q uid=%q product=%q", gotAuth, gotUID, gotProduct)
 	}
 	if !bytes.Contains(gotBody, []byte(`"stream":true`)) {
@@ -243,6 +243,8 @@ func TestFetchModelsEffortsDriveBodyDowngrade(t *testing.T) {
 			return jsonResp(200, `{"code":0,"data":{"models":[
 				{"id":"glm-5.2","name":"GLM-5.2","maxInputTokens":131072,"maxOutputTokens":8192,"reasoning":{"effort":"high","supportedEfforts":["low","high"]}}
 			],"agents":[{"name":"cli","models":["glm-5.2"]}]}}`), nil
+		case strings.HasSuffix(r.URL.Path, "/v3/config"):
+			return jsonResp(200, `{"code":0,"data":{"models":[]}}`), nil
 		default:
 			outbound, _ = io.ReadAll(r.Body)
 			return &http.Response{
@@ -268,7 +270,7 @@ func TestFetchModelsEffortsDriveBodyDowngrade(t *testing.T) {
 		t.Errorf("infos[0].DefaultEffort=%q want high", infos[0].DefaultEffort)
 	}
 	// glm-5.2 只支持 low/high，请求 max → 降级为 high
-	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","reasoning_effort":"max","messages":[]}`), "")
+	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","reasoning_effort":"max","messages":[]}`), "", ChatMeta{})
 	if err != nil || status != 200 {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
@@ -287,7 +289,7 @@ func TestChatStreamHardCreditError(t *testing.T) {
 		return jsonResp(402, `{"code":1,"msg":"余额不足"}`), nil
 	})
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	_, status, respBody, err := c.ChatStream(a, []byte(`{}`), "")
+	_, status, respBody, err := c.ChatStream(a, []byte(`{}`), "", ChatMeta{})
 	if status != 402 {
 		t.Errorf("status=%d", status)
 	}
@@ -326,7 +328,7 @@ func TestChatStreamReadsMultipleChunksOverRealTransport(t *testing.T) {
 	c.IdleTimeout = 5 * time.Second
 
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`), "")
+	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`), "", ChatMeta{})
 	if err != nil || status != 200 {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
@@ -453,7 +455,7 @@ func TestChatStreamRoutesToChatHTTP(t *testing.T) {
 		}, nil
 	})}
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	rc, status, _, err := c.ChatStream(a, []byte(`{}`), "")
+	rc, status, _, err := c.ChatStream(a, []byte(`{}`), "", ChatMeta{})
 	if err != nil || status != 200 {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
@@ -509,5 +511,70 @@ func TestFetchModelsDefaultEffortDualKeyAndSizes(t *testing.T) {
 	}
 	if au := byID["auto"]; au.DefaultEffort != "high" {
 		t.Errorf("auto DefaultEffort=%q want high (from legacy effort key)", au.DefaultEffort)
+	}
+}
+
+func TestFetchModelsOverlaysV3ConfigCapabilities(t *testing.T) {
+	// CLI 目录给 flash 精简字段（128K / 固定 high）；IDE /v3/config 给完整能力。
+	var sawIDE bool
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/console/enterprises/personal/models"):
+			return jsonResp(200, `{"code":0,"data":{"models":[
+				{"id":"deepseek-v4.1-flash","name":"Deepseek-V4.1-Flash","maxInputTokens":1000000,"maxOutputTokens":128000,"credits":"x0.03 credits","supportsReasoning":true,"onlyReasoning":true,"reasoning":{"effort":"high","summary":"auto"}}
+			],"agents":[{"name":"cli","models":["deepseek-v4.1-flash"]}]}}`), nil
+		case strings.HasSuffix(r.URL.Path, "/v3/config"):
+			sawIDE = true
+			if r.Header.Get("User-Agent") != codeBuddyIDEUA {
+				t.Errorf("v3/config UA=%q want %s", r.Header.Get("User-Agent"), codeBuddyIDEUA)
+			}
+			if r.Header.Get("X-Product") != "SaaS" {
+				t.Errorf("X-Product=%q want SaaS", r.Header.Get("X-Product"))
+			}
+			if r.Header.Get("X-User-Id") != "u1" {
+				t.Errorf("X-User-Id=%q want u1", r.Header.Get("X-User-Id"))
+			}
+			return jsonResp(200, `{"code":0,"data":{"models":[
+				{"id":"deepseek-v4.1-flash","name":"Deepseek-V4.1-Flash","maxInputTokens":1000000,"maxOutputTokens":393216,"credits":"x0.03","supportsReasoning":true,"onlyReasoning":true,"reasoning":{"canDisableThinking":true,"defaultEffort":"high","summary":"auto","supportedEfforts":["low","high","max"]}}
+			]}}`), nil
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			return jsonResp(404, `{}`), nil
+		}
+	})
+	a := &auth.Auth{AccessToken: "at", UID: "u1", Domain: "copilot.tencent.com"}
+	infos, err := c.FetchModels(a)
+	if err != nil {
+		t.Fatalf("fetch models: %v", err)
+	}
+	if !sawIDE {
+		t.Fatal("expected /v3/config request")
+	}
+	if len(infos) != 1 {
+		t.Fatalf("infos=%+v", infos)
+	}
+	mi := infos[0]
+	if mi.MaxTokens != 393216 {
+		t.Errorf("MaxTokens=%d want 393216", mi.MaxTokens)
+	}
+	if mi.ContextWindow != 1000000 {
+		t.Errorf("ContextWindow=%d want 1000000", mi.ContextWindow)
+	}
+	if !mi.CanDisableThinking || !mi.SupportsReasoning {
+		t.Errorf("flags canDisable=%v supportsReasoning=%v", mi.CanDisableThinking, mi.SupportsReasoning)
+	}
+	if mi.DefaultEffort != "high" {
+		t.Errorf("DefaultEffort=%q want high", mi.DefaultEffort)
+	}
+	if got := strings.Join(mi.Efforts, ","); got != "low,high,max" {
+		t.Errorf("Efforts=%v want low,high,max", mi.Efforts)
+	}
+}
+
+func TestMergeModelCapabilitiesKeepsCLIWhenOverlayEmpty(t *testing.T) {
+	base := []ModelInfo{{ID: "m", MaxTokens: 128000, DefaultEffort: "high"}}
+	got := mergeModelCapabilities(base, map[string]ModelInfo{"m": {ID: "m"}})
+	if got[0].MaxTokens != 128000 || got[0].DefaultEffort != "high" {
+		t.Errorf("empty overlay wiped CLI fields: %+v", got[0])
 	}
 }

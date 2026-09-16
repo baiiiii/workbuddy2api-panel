@@ -75,6 +75,41 @@ function dur(sec) {
   return h ? h + '时' + String(m).padStart(2, '0') + '分' : m ? m + '分' + String(s).padStart(2, '0') + '秒' : s + '秒';
 }
 
+function formatTokenCount(tokens) {
+  if (tokens == null || tokens === '') return '—';
+  const n = Number(tokens);
+  if (!Number.isFinite(n) || n < 0) return '—';
+  if (n < 1000) return String(Math.round(n));
+  const units = [['k', 1e3], ['m', 1e6], ['b', 1e9]];
+  let unit = units[0];
+  for (const candidate of units) {
+    if (n >= candidate[1]) unit = candidate;
+  }
+  let value = n / unit[1];
+  let rounded = Number(value.toFixed(1));
+  // 999999 → 1m，而不是 1000k；四舍五入后自动升级单位。
+  const next = units[units.indexOf(unit) + 1];
+  if (next && rounded >= 1000) {
+    unit = next;
+    value = n / unit[1];
+    rounded = Number(value.toFixed(1));
+  }
+  return rounded + unit[0];
+}
+
+function formatLatency(ms) {
+  if (ms == null || ms === '') return '—';
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n <= 0) return '—';
+  return n < 1000 ? Math.round(n) + 'ms' : (n / 1000).toFixed(1).replace(/\.0$/, '') + 's';
+}
+function formatRate(rate) {
+  if (rate == null || rate === '') return '—';
+  const n = Number(rate);
+  if (!Number.isFinite(n) || n < 0) return '—';
+  return n.toFixed(1) + 'tok/s';
+}
+
 /* ── 密钥门 ───────────────────────────────────────────────────────── */
 function openKey() { $('keyVeil').classList.add('on'); setTimeout(() => $('keyInput').focus(), 60); }
 $('btnKey').onclick = async () => {
@@ -91,7 +126,7 @@ $('btnKey').onclick = async () => {
 $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
-const TITLES = { accounts: '账号池', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
@@ -100,6 +135,8 @@ function go(v) {
   if (v === 'models' && !$('mdBody').children.length) loadModels();
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
+  if (v === 'usage') loadUsage();
+  if (v === 'packages') loadPackages();
   if (v === 'taskscenter') { loadSchoolStatus(true); pollQueueOnce(); }
 }
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
@@ -109,7 +146,7 @@ go((location.hash || '#accounts').slice(1) in TITLES ? (location.hash || '#accou
 function renderAccounts(list) {
   const tb = $('accBody');
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="8"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
     return;
   }
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
@@ -132,13 +169,26 @@ function renderAccounts(list) {
       : Math.round((s.credits || 0) / maxCred * 100);
     const credTip = s.credits_total > 0 ? '剩余 ' + s.credits + ' / 总额 ' + s.credits_total + '（' + pct + '%）' : '积分（相对池内最高）';
     const frozen = s.disabled || cool > 0;
+    const tu = s.token_usage || {};
+    const req = tu.request_count || 0;
+    const totalTok = formatTokenCount(tu.total_tokens);
+    const totalTokUnit = totalTok === '—' ? '' : '<em>tok</em>';
+    const latency = formatLatency(tu.last_latency_ms);
+    const rate = formatRate(tu.last_tokens_per_second);
+    const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + '</td>' +
       '<td class="cred" title="' + credTip + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
       '<td class="num">' + (s.in_flight || 0) + '</td>' +
+      '<td class="num usage-cell" title="' + esc(usageTitle) + '"><span class="usage-line" aria-label="' + esc(usageTitle) + '">' +
+        '<span class="usage-item usage-count"><b>' + req + '</b><em>次</em></span>' +
+        '<span class="usage-item usage-total"><b>' + totalTok + '</b>' + totalTokUnit + '</span>' +
+        '<span class="usage-item usage-latency"><b>' + latency + '</b></span>' +
+        '<span class="usage-item usage-rate"><b>' + rate + '</b></span>' +
+      '</span></td>' +
       '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success) + '</td>' +
       '<td class="acts">' +
         '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '">签到</button>' +
@@ -224,13 +274,48 @@ $('btnActivityAll').onclick = async () => {
 };
 
 /* ── 模型 ─────────────────────────────────────────────────────────── */
+/* 实测上限标注：scripts/probe_max_tokens.py --panel-out 写入探测结果，
+   /panel/api/model_probes 只读透传。探测键带域前缀（cn:glm-5.2），模型表
+   显示裸名，按「精确命中或 :后缀」关联。无数据时本列退回上游声称值。 */
+function fmtK(n) { n = Number(n || 0); return n >= 1000 ? Math.round(n / 1000) + 'K' : String(n); }
+function probeDays(ts) {
+  if (!ts) return null;
+  const t = new Date(String(ts).replace(' ', 'T'));
+  const d = (Date.now() - t.getTime()) / 86400000;
+  return isNaN(d) ? null : Math.floor(d);
+}
+function outCell(m, pr) {
+  if (!pr) return '<td class="num">' + (m.max_output_tokens ? fmtK(m.max_output_tokens) : '—') + '</td>';
+  const tip = '声称 ' + (pr.claimed ? fmtK(pr.claimed) : '?') + ' · 实测 ' + (pr.measured ? fmtK(pr.measured) : '?') +
+    (pr.note ? ' · ' + pr.note : '') + (pr.tested_at ? ' · 探测于 ' + pr.tested_at : '');
+  const days = probeDays(pr.tested_at);
+  const stale = days !== null && days > 30 ? ' · ' + days + ' 天前' : '';
+  if (pr.verdict === 'clamped' && pr.measured) {
+    if (pr.claimed && pr.measured < pr.claimed) {
+      const x = pr.claimed / pr.measured;
+      const xs = (x >= 10 ? Math.round(x) : Math.round(x * 10) / 10) + '×';
+      return '<td class="num" title="' + esc(tip) + '"><span style="color:var(--warn);font-weight:600">' +
+        fmtK(pr.measured) + ' ⚠</span><div class="note">钳制 ' + xs + stale + '</div></td>';
+    }
+    return '<td class="num" title="' + esc(tip) + '"><span style="color:var(--ok)">' + fmtK(pr.measured) +
+      (pr.claimed && pr.measured > pr.claimed ? ' ↑' : ' ✓') + '</span></td>';
+  }
+  if (pr.verdict === 'at_least' && pr.measured)
+    return '<td class="num" title="' + esc(tip) + '"><span style="color:var(--ink-3)">≥' + fmtK(pr.measured) + '</span></td>';
+  return '<td class="num" title="' + esc(tip) + '"><span style="color:var(--ink-3)">?</span><div class="note">未测出' + stale + '</div></td>';
+}
+
 async function loadModels() {
   const tb = $('mdBody');
   tb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
   try {
-    const d = await api('models');
+    // 探测数据是可选增强：拉取失败不影响模型列表本身
+    const [d, pr] = await Promise.all([api('models'), api('model_probes').catch(() => ({}))]);
     const list = d.models || [];
     if (!list.length) { tb.innerHTML = '<tr><td colspan="7"><div class="empty">上游未返回模型</div></td></tr>'; return; }
+    const probes = pr.probes || {};
+    const probeKeys = Object.keys(probes);
+    const probeOf = id => probes[id] || probes[probeKeys.find(k => k.endsWith(':' + id))];
     tb.innerHTML = list.map(m => {
       const eff = (m.supported_efforts || []).slice();
       if (m.can_disable_thinking && eff.length && !eff.includes('off')) eff.push('off（可关）');
@@ -241,9 +326,10 @@ async function loadModels() {
         '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
         '<td class="efs" style="white-space:normal">' + effs + '</td>' +
         '<td class="num">' + (m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—') + '</td>' +
-        '<td class="num">' + (m.max_output_tokens ? Math.round(m.max_output_tokens / 1000) + 'K' : '—') + '</td></tr>';
+        outCell(m, probeOf(m.id)) + '</tr>';
     }).join('');
-    $('mdNote').textContent = list.length + ' 个模型 · 已刷新降级缓存';
+    const hit = list.filter(m => probeOf(m.id)).length;
+    $('mdNote').textContent = list.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '');
   } catch (e) {
     tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
   }
@@ -375,18 +461,29 @@ $('cfgForm').onsubmit = async ev => {
 /* ── 添加账号 ─────────────────────────────────────────────────────── */
 function openAdd() {
   $('addVeil').classList.add('on');
-  $('addLoad').hidden = false; $('addReady').hidden = true;
+  // 重置到选域态：选域可见、加载/就绪/完成/错误全收，起始按钮亮起。
+  $('addPick').hidden = false;
+  $('addLoad').hidden = true; $('addReady').hidden = true;
   $('addDone').hidden = true; $('addErr').hidden = true;
   $('btnCopyUrl').hidden = true; $('btnOpenUrl').hidden = true;
+  $('btnStartLogin').hidden = false; $('btnStartLogin').disabled = false;
   stopPoll();
-  api('login/start', { method: 'POST' }).then(r => {
+}
+function startAddLogin() {
+  const realm = (document.querySelector('input[name="addRealm"]:checked') || {}).value || 'cn';
+  $('btnStartLogin').disabled = true;
+  $('addLoad').hidden = false; $('addErr').hidden = true;
+  api('login/start', { method: 'POST', body: JSON.stringify({ realm }) }).then(r => {
     loginState = r.state;
     $('addUrl').textContent = r.url;
+    $('addPick').hidden = true; // 选域锁定（会话已按该域发起）
     $('addLoad').hidden = true; $('addReady').hidden = false;
+    $('btnStartLogin').hidden = true;
     $('btnCopyUrl').hidden = false; $('btnOpenUrl').hidden = false;
     loginTimer = setInterval(pollLogin, 3000);
   }).catch(e => {
     $('addLoad').hidden = true;
+    $('btnStartLogin').disabled = false;
     $('addErr').hidden = false;
     $('addErr').textContent = e.message;
   });
@@ -400,7 +497,7 @@ async function pollLogin() {
       stopPoll();
       $('addReady').hidden = true;
       $('addDone').hidden = false;
-      $('addDone').textContent = '已添加 ' + (r.nickname || r.uid) + (r.credits >= 0 ? ' · 积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + '，账号已载入池中';
+      $('addDone').textContent = '已添加 ' + (r.nickname || r.uid) + (r.realm === 'global' ? '（国际版）' : '') + (r.credits >= 0 ? ' · 积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + '，账号已载入池中';
       setTimeout(() => { closeAdd(); loadOverview(true); }, 1600);
     }
   } catch (e) {
@@ -412,6 +509,7 @@ async function pollLogin() {
 }
 function closeAdd() { stopPoll(); loginState = null; $('addVeil').classList.remove('on'); }
 $('btnCloseAdd').onclick = closeAdd;
+$('btnStartLogin').onclick = startAddLogin;
 $('btnOpenUrl').onclick = () => open($('addUrl').textContent, '_blank');
 $('btnCopyUrl').onclick = () => navigator.clipboard.writeText($('addUrl').textContent)
   .then(() => toast('链接已复制', 'ok'), () => toast('复制失败，请手动选择复制', 'err'));
@@ -681,6 +779,240 @@ $('btnSchoolRunAll').onclick = async () => {
   } catch (e) { toast(e.message, 'err'); }
 };
 
+/* ── 精简 QR 编码器（券码二维码用）────────────────────────────────────
+   规格子集：byte 模式、ECC L、版本 1-5（全部单纠错块，免块交织）、固定掩码 0。
+   完整性：规范允许任选掩码（解码器按格式信息位自行去掩码），固定掩码不影响
+   可扫描性；已用 python qrcode 库对多输入多版本做逐像素交叉验证（强制 byte
+   模式 + mask 0，5/5 全部 diff=0）。面板 CSP 只允许 self，外链 QR 服务不可用。 */
+// qr_gen.js —— 精简 QR 编码器（浏览器用 + node 可跑交叉验证）
+// 规格子集：byte 模式、ECC L、版本 1-5（全部单纠错块，免块交织）、固定掩码 0。
+// 完整性说明：规范允许编码器任选掩码（解码器按格式信息位自行去掩码），
+// 固定掩码不影响可扫描性；券码为短文本，v1-5（26 字节起）绰绰有余。
+
+// GF(256) 对数/指数表（本原多项式 0x11d）
+const QR_EXP = new Array(512), QR_LOG = new Array(256);
+(() => {
+  let x = 1;
+  for (let i = 0; i < 255; i++) { QR_EXP[i] = x; QR_LOG[x] = i; x <<= 1; if (x & 0x100) x ^= 0x11d; }
+  for (let i = 255; i < 512; i++) QR_EXP[i] = QR_EXP[i - 255];
+})();
+const gmul = (a, b) => (a && b) ? QR_EXP[QR_LOG[a] + QR_LOG[b]] : 0;
+
+// 各版本参数（下标 = 版本-1）：[数据码字数, 纠错码字数]，ECC L 单块
+const QR_V = [[19, 7], [34, 10], [55, 15], [80, 20], [108, 26]];
+// 对齐图案中心坐标（v2+；与定位图案重叠的位置在放置时跳过）
+const QR_ALIGN = [[], [6, 18], [6, 22], [6, 26], [6, 30]];
+const QR_MASK = (r, c) => (r + c) % 2 === 0; // 掩码模式 0
+
+// 生成多项式（最高次系数在前，g[0] 恒为 1）
+function qrGenPoly(deg) {
+  let g = [1];
+  for (let i = 0; i < deg; i++) {
+    const a = QR_EXP[i], ng = new Array(g.length + 1).fill(0);
+    ng[0] = g[0];
+    for (let j = 1; j < g.length; j++) ng[j] = g[j] ^ gmul(a, g[j - 1]);
+    ng[g.length] = gmul(a, g[g.length - 1]);
+    g = ng;
+  }
+  return g;
+}
+
+// Reed-Solomon 求余（综合除法），返回 deg 个纠错码字
+function rsRem(data, deg) {
+  const g = qrGenPoly(deg);
+  const res = data.concat(new Array(deg).fill(0));
+  for (let i = 0; i < data.length; i++) {
+    const f = res[i];
+    if (f) for (let j = 0; j < g.length; j++) res[i + j] ^= gmul(g[j], f);
+  }
+  return res.slice(data.length);
+}
+
+// 文本 → 码字流（byte 模式：0100 + 8 位计数 + 数据 + 终止符 + 0xEC/0x11 填充）
+function qrDataCodewords(text, dataCap) {
+  const bytes = Array.from(new TextEncoder().encode(text));
+  const bits = [];
+  const push = (val, n) => { for (let i = n - 1; i >= 0; i--) bits.push((val >> i) & 1); };
+  push(4, 4);            // byte 模式
+  push(bytes.length, 8); // v1-9 计数 8 位
+  for (const b of bytes) push(b, 8);
+  const cap = dataCap * 8;
+  push(0, Math.min(4, cap - bits.length));   // 终止符
+  while (bits.length % 8) bits.push(0);
+  const out = [];
+  for (let i = 0; i < bits.length; i += 8) {
+    let v = 0; for (const b of bits.slice(i, i + 8)) v = (v << 1) | b;
+    out.push(v);
+  }
+  for (let p = 0; out.length < dataCap; p ^= 1) out.push(p ? 0x11 : 0xEC);
+  return out;
+}
+
+// 主入口：text → 布尔矩阵（true=深色模块）
+function qrMatrix(text) {
+  const bytes = Array.from(new TextEncoder().encode(text));
+  // 版本选择：需求 ≈ 2 码字头 + 文本长度，取首个放得下的版本
+  let ver = 0;
+  for (let v = 0; v < QR_V.length; v++) { if (bytes.length + 2 <= QR_V[v][0]) { ver = v + 1; break; } }
+  if (!ver) throw new Error('QR: text too long (>' + QR_V[4][0] + ' bytes)');
+  const [dataCap, ecCap] = QR_V[ver - 1];
+  const n = 17 + 4 * ver;
+
+  const M = Array.from({ length: n }, () => new Array(n).fill(false));
+  const F = Array.from({ length: n }, () => new Array(n).fill(false)); // 功能模块占位
+
+  const setF = (r, c, v) => { M[r][c] = v; F[r][c] = true; };
+  // 定位图案 + 分隔带
+  const finder = (r0, c0) => {
+    for (let r = -1; r <= 7; r++) for (let c = -1; c <= 7; c++) {
+      const rr = r0 + r, cc = c0 + c;
+      if (rr < 0 || cc < 0 || rr >= n || cc >= n) continue;
+      const dark = r >= 0 && r <= 6 && c >= 0 && c <= 6 && (r === 0 || r === 6 || c === 0 || c === 6 || (r >= 2 && r <= 4 && c >= 2 && c <= 4));
+      setF(rr, cc, dark);
+    }
+  };
+  finder(0, 0); finder(0, n - 7); finder(n - 7, 0);
+  // 校正图形（仅贯穿两定位图案之间：8..n-9，不得覆盖定位图案本体）
+  for (let r = 8; r <= n - 9; r++) setF(r, 6, r % 2 === 0);
+  for (let c = 8; c <= n - 9; c++) setF(6, c, c % 2 === 0);
+  // 对齐图案（v2+，跳过与定位重叠处）
+  const align = QR_ALIGN[ver - 1] || [];
+  for (const ar of align) for (const ac of align) {
+    if (F[ar][ac]) continue;
+    for (let r = -2; r <= 2; r++) for (let c = -2; c <= 2; c++)
+      setF(ar + r, ac + c, Math.max(Math.abs(r), Math.abs(c)) !== 1);
+  }
+  // 暗模块 + 格式信息（ECC L=01，掩码 0）——BCH(15,5) + 0x5412 异或。
+  // 位序遵循规范（与 python qrcode 逐位对齐验证）：bit i 从 LSB 起数，
+  // 副本一走左上角 L 形、副本二走右下 L 形。
+  let fmt = (1 << 3) | 0; // L<<3 | mask
+  let rem = fmt << 10;
+  for (let i = 14; i >= 10; i--) if ((rem >> i) & 1) rem ^= 0x537 << (i - 10);
+  fmt = ((fmt << 10) | rem) ^ 0x5412; // 15 位
+  const fb = i => (fmt >> i) & 1;
+  // 副本一（左上）：位 0..5 → (i,8)；6 → (7,8)；7 → (8,8)
+  for (let i = 0; i <= 5; i++) setF(i, 8, !!fb(i));
+  setF(7, 8, !!fb(6)); setF(8, 8, !!fb(7));
+  // 副本一续 + 副本二（右下）：位 8..14 → (n-15+i, 8)；位 0..7 → (8, n-1-i)；8 → (8,7)；9..14 → (8,14-i)
+  for (let i = 8; i <= 14; i++) setF(n - 15 + i, 8, !!fb(i));
+  for (let i = 0; i <= 7; i++) setF(8, n - 1 - i, !!fb(i));
+  setF(8, 7, !!fb(8));
+  for (let i = 9; i <= 14; i++) setF(8, 14 - i, !!fb(i));
+  // 暗模块（恒为深色，位于副本一垂直段末端）
+  setF(n - 8, 8, true);
+
+
+  // 数据码字 + 纠错码字 → 位流
+  const dcw = qrDataCodewords(text, dataCap);
+  const cw = dcw.concat(rsRem(dcw, ecCap));
+  const bits = [];
+  for (const b of cw) for (let i = 7; i >= 0; i--) bits.push((b >> i) & 1);
+
+  // 蛇形放置（成对列，从右向左，跳过第 6 列），写数据时直接异或掩码
+  let bi = 0, up = true;
+  for (let x = n - 1; x > 0; x -= 2) {
+    if (x === 6) x--;
+    for (let i = 0; i < n; i++) {
+      const r = up ? n - 1 - i : i;
+      for (const c of [x, x - 1]) {
+        if (F[r][c]) continue;
+        const bit = bi < bits.length ? bits[bi++] : 0;
+        M[r][c] = bit ? !QR_MASK(r, c) : QR_MASK(r, c);
+      }
+    }
+    up = !up;
+  }
+  return M;
+}
+
+// 矩阵 → SVG（quiet zone 4 模块）
+function qrSVG(M, px) {
+  const n = M.length, q = 4, total = n + q * 2;
+  let s = '<svg viewBox="0 0 ' + total + ' ' + total + '" width="' + px + '" height="' + px + '" shape-rendering="crispEdges" role="img" style="background:#fff">';
+  for (let r = 0; r < n; r++) for (let c = 0; c < n; c++)
+    if (M[r][c]) s += '<rect x="' + (c + q) + '" y="' + (r + q) + '" width="1" height="1"/>';
+  return s + '</svg>';
+}
+
+/* ── 开学季券码查询（弹窗，仿活动页 #/prizes?tab=vouchers）──────────── */
+/* copyText：clipboard API 只在 secure context（https/localhost）可用，
+   远程 http 面板会拿不到 navigator.clipboard → 降级 execCommand。 */
+function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text);
+  return new Promise((resolve, reject) => {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position:fixed;opacity:0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy') ? resolve() : reject(new Error('copy failed')); }
+    catch (e) { reject(e); }
+    finally { ta.remove(); }
+  });
+}
+
+function vcCard(v) {
+  const expired = v.valid_to && new Date(v.valid_to) < new Date();
+  return '<div class="vc' + (expired ? ' expired' : '') + '">' +
+    '<div class="hd"><span class="nm">' + esc(v.prize_name || v.sku_code || '券') + '</span>' +
+    (expired ? '<span class="tag bad">已过期</span>' : '<span class="tag ok">可使用</span>') + '</div>' +
+    '<div class="meta">' +
+      (v.valid_to ? '有效期至 ' + esc(v.valid_to) : '长期有效') +
+      (v.granted_at ? ' · ' + esc(v.granted_at.slice(0, 10)) + ' 抽中' : '') +
+    '</div>' +
+    '<div class="sep"></div>' +
+    '<div class="ft"><span class="lab">券码</span><code>' + esc(v.code || '-') + '</code>' +
+    '<span class="acts">' +
+      (v.code ? '<button class="xs ghost" data-qr="' + esc(v.code) + '">二维码</button>' : '') +
+      '<button class="xs ghost" data-copy="' + esc(v.code || '') + '">复制</button>' +
+    '</span></div>' +
+    '</div>';
+}
+
+async function loadSchoolVouchers() {
+  const body = $('vcBody');
+  $('vcVeil').classList.add('on');
+  body.innerHTML = '<div class="state"><span class="dots">查询中</span></div>';
+  $('vcNote').textContent = '';
+  try {
+    const d = await api('school/vouchers');
+    const arr = d.accounts || [];
+    const ok = arr.filter(a => !a.error);
+    const total = ok.reduce((n, a) => n + (a.vouchers || []).length, 0);
+    body.innerHTML = ok.filter(a => (a.vouchers || []).length).map(a =>
+      '<div class="vc-acct"><span class="nm">' + esc(a.nickname || a.uid) + '</span>' +
+      '<span>' + a.vouchers.length + ' 张</span></div>' +
+      a.vouchers.map(vcCard).join('')
+    ).join('') || '<div class="empty"><div class="big">🎟️</div>还没有抽到券</div>';
+    $('vcNote').textContent = total ? total + ' 张券 · ' + ok.filter(a => !(a.vouchers || []).length).length + ' 个账号未抽中' : '';
+    const errs = arr.filter(a => a.error);
+    if (errs.length) {
+      body.insertAdjacentHTML('beforeend', '<div class="note" style="color:var(--warn);margin-top:8px">查询失败：' +
+        errs.map(a => esc(a.nickname || a.uid.slice(0, 8)) + '（' + esc(a.error) + '）').join('、') + '</div>');
+    }
+    body.querySelectorAll('button[data-copy]').forEach(b => b.onclick = async () => {
+      try { await copyText(b.dataset.copy); toast('券码已复制', 'ok'); }
+      catch (e) { toast('复制失败，请手动选择券码', 'err'); }
+    });
+    // 二维码：券码本体编码为 QR（到店出示扫描），点击切换显示/隐藏
+    body.querySelectorAll('button[data-qr]').forEach(b => b.onclick = () => {
+      const card = b.closest('.vc');
+      const old = card.querySelector('.vc-qr');
+      if (old) { old.remove(); return; }
+      const box = document.createElement('div');
+      box.className = 'vc-qr';
+      try { box.innerHTML = qrSVG(qrMatrix(b.dataset.qr), 148); }
+      catch (e) { box.innerHTML = '<span class="note">二维码生成失败：' + esc(e.message) + '</span>'; }
+      card.appendChild(box);
+    });
+  } catch (e) {
+    body.innerHTML = '<div class="state err">' + esc(e.message) + '</div>';
+  }
+}
+$('btnSchoolVouchers').onclick = loadSchoolVouchers;
+$('btnVcClose').onclick = () => $('vcVeil').classList.remove('on');
+$('btnVcRefresh').onclick = loadSchoolVouchers;
+
 /* 成长任务队列。lastQueueSeq 记录本页启动过的队列代次：执行结束后的残留 items
    （running=false 但 seq 停在旧值）不再回写视图——否则扫描结果 3 秒后被上一轮
    队列状态覆盖。 */
@@ -805,3 +1137,294 @@ function startQueuePolling() {
     } catch (e) { /* 忽略 */ }
   }, 3000);
 }
+
+/* ── 用量 ─────────────────────────────────────────────────────────── */
+/* 图表用原生 SVG 手绘：面板是 go:embed 单文件、无构建步骤，引入图表库
+   就得带上打包器，得不偿失。这里只需要堆叠柱状图，二十行足够。 */
+
+function fmtTok(n) {
+  n = Number(n || 0);
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+  return String(n);
+}
+function fmtMs(ms) {
+  ms = Number(ms || 0);
+  if (!ms) return '—';
+  if (ms >= 1000) return (ms / 1000).toFixed(2) + 's';
+  return Math.round(ms) + 'ms';
+}
+function fmtRate(r) { return r ? Number(r).toFixed(1) + ' tok/s' : '—'; }
+
+function usStat(v, k, cls) {
+  return '<div class="stat ' + (cls || '') + '"><div class="v">' + esc(v) +
+         '</div><div class="k">' + esc(k) + '</div></div>';
+}
+
+function usBar(prompt, completion, total) {
+  const t = Number(total || 0);
+  if (!t) return '';
+  const pp = Math.max(0, Math.min(100, Number(prompt || 0) / t * 100));
+  const pc = Math.max(0, Math.min(100, Number(completion || 0) / t * 100));
+  return '<span class="us-wrapbar">' +
+    '<span class="bar bar-p" style="width:' + (pp * 0.8).toFixed(1) + 'px" title="prompt"></span>' +
+    '<span class="bar bar-c" style="width:' + Math.max(2, pc * 0.8).toFixed(1) + 'px" title="completion"></span>' +
+    '</span>';
+}
+
+/* usRow 生成一行。mid 是插在「名称」之后、请求数之前的额外单元格（如「域」列）。
+   withPerf 控制是否追加延迟/速率两列——只有「按账号」表的表头带这两列；
+   模型表与域表没有，多输出会造成列错位。早先靠「mid 是否为 undefined」隐式
+   判断，调用方稍一改动就会错列，故改为显式参数。 */
+function usRow(name, sub, a, mid, withPerf) {
+  return '<tr>' +
+    '<td class="mark" aria-hidden="true"></td>' +
+    '<td>' + esc(name) + (sub ? '<div class="note">' + esc(sub) + '</div>' : '') + '</td>' +
+    (mid || '') +
+    '<td class="num">' + fmtTok(a.requests) + '</td>' +
+    '<td class="num">' + (a.errors ? '<span style="color:var(--warn)">' + fmtTok(a.errors) + '</span>' : '—') + '</td>' +
+    '<td class="num">' + fmtTok(a.prompt_tokens) + '</td>' +
+    '<td class="num">' + fmtTok(a.completion_tokens) + '</td>' +
+    '<td class="num">' + fmtTok(a.total_tokens) + '</td>' +
+    (withPerf
+      ? '<td class="num">' + fmtMs(a.avg_latency_ms) + '</td>' +
+        '<td class="num">' + fmtRate(a.avg_tokens_per_second) + '</td>'
+      : '') +
+    '</tr>';
+}
+
+function renderUsage(d) {
+  const t = d.totals || {};
+  $('usStats').innerHTML =
+    usStat(fmtTok(t.requests), '请求数') +
+    usStat(fmtTok(t.total_tokens), '总 token') +
+    usStat(fmtTok(t.prompt_tokens), 'prompt') +
+    usStat(fmtTok(t.completion_tokens), 'completion') +
+    usStat(t.errors ? String(t.errors) : '0', '失败尝试', t.errors ? 'warn' : '') +
+    usStat(fmtMs(t.avg_latency_ms), '平均延迟');
+
+  $('usNote').textContent = (d.buckets || 0) + ' 个分桶 · ' +
+    (d.since ? '自 ' + d.since.slice(0, 10) : '无数据') +
+    (d.file_bytes ? ' · ' + (d.file_bytes / 1024).toFixed(1) + ' KB' : '');
+
+  $('usAccBody').innerHTML = (d.by_account || []).map(x =>
+    usRow(x.key.slice(0, 8), x.extra || '', x,
+      '<td class="num">' + esc(x.realm || '') + '</td>', true)
+  ).join('') || '<tr><td colspan="10" class="empty">暂无数据</td></tr>';
+
+  $('usModelBody').innerHTML = (d.by_model || []).map(x =>
+    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
+
+  $('usRealmBody').innerHTML = (d.by_realm || []).map(x =>
+    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
+
+  renderUsageChart(d.series || []);
+}
+
+/* renderUsageChart 画堆叠柱状图。日点与小时点混用 x 轴，因此按数据序号等距
+   排布（不按真实时间比例），并在标签上区分粒度——用量面板看的是相对高低，
+   不是精确的时间刻度。 */
+function renderUsageChart(series) {
+  const host = $('usChart');
+  if (!series.length) {
+    host.innerHTML = '<div class="us-empty">暂无用量数据。发起一次对话后再刷新。</div>';
+    return;
+  }
+  const W = 760, H = 170, PL = 46, PR = 10, PT = 12, PB = 26;
+  const iw = W - PL - PR, ih = H - PT - PB;
+
+  const max = Math.max(1, ...series.map(p => Number(p.total_tokens || 0)));
+  const bw = Math.max(2, Math.min(26, iw / series.length - 3));
+
+  let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" role="img">';
+  // y 轴网格 + 刻度（4 档）
+  for (let i = 0; i <= 4; i++) {
+    const v = max * i / 4;
+    const y = PT + ih - (ih * i / 4);
+    out += '<line class="gl" x1="' + PL + '" y1="' + y + '" x2="' + (W - PR) + '" y2="' + y + '"/>';
+    out += '<text class="tk" x="' + (PL - 6) + '" y="' + (y + 3.5) + '" text-anchor="end">' + fmtTok(v) + '</text>';
+  }
+  out += '<line class="ax" x1="' + PL + '" y1="' + (PT + ih) + '" x2="' + (W - PR) + '" y2="' + (PT + ih) + '"/>';
+
+  const step = iw / series.length;
+  series.forEach((p, i) => {
+    const pt = Number(p.prompt_tokens || 0), ct = Number(p.completion_tokens || 0);
+    const tt = Number(p.total_tokens || 0) || (pt + ct);
+    const x = PL + i * step + (step - bw) / 2;
+    const hTot = ih * (tt / max);
+    const hP = tt ? hTot * (pt / tt) : 0;
+    const hC = Math.max(tt && ct ? 1 : 0, hTot - hP);
+    const yBase = PT + ih;
+    if (hP > 0) out += '<rect x="' + x.toFixed(1) + '" y="' + (yBase - hP).toFixed(1) +
+      '" width="' + bw.toFixed(1) + '" height="' + hP.toFixed(1) + '" fill="var(--accent)" rx="1.5"/>';
+    if (hC > 0) out += '<rect x="' + x.toFixed(1) + '" y="' + (yBase - hP - hC).toFixed(1) +
+      '" width="' + bw.toFixed(1) + '" height="' + hC.toFixed(1) + '" fill="var(--ok)" rx="1.5"/>';
+    // 只给稀疏的几根画标签，避免拥挤
+    const every = Math.ceil(series.length / 8);
+    if (i % every === 0) {
+      const lab = p.scope === 'day' ? p.t.slice(5) : p.t.slice(11) + ':00';
+      out += '<text class="tk" x="' + (x + bw / 2).toFixed(1) + '" y="' + (H - 8) +
+        '" text-anchor="middle">' + esc(lab) + '</text>';
+    }
+    out += '<title>' + esc(p.t) + ' (' + esc(p.scope) + ')  ' +
+      fmtTok(p.prompt_tokens) + ' prompt / ' + fmtTok(p.completion_tokens) + ' completion / ' +
+      (p.requests || 0) + ' 次</title>';
+  });
+  out += '</svg>';
+  host.innerHTML = out;
+}
+
+function fmtTokTip(v) { return fmtTok(v); }
+
+async function loadUsage() {
+  const hours = ($('usWindow') && $('usWindow').value) || 72;
+  try {
+    const d = await api('usage?hours=' + encodeURIComponent(hours));
+    renderUsage(d);
+  } catch (e) {
+    $('usChart').innerHTML = '<div class="us-empty">读取用量失败：' + esc(e.message) + '</div>';
+  }
+}
+
+if ($('btnUsage')) $('btnUsage').onclick = loadUsage;
+if ($('usWindow')) $('usWindow').onchange = loadUsage;
+
+/* ── 积分构成 ─────────────────────────────────────────────────────── */
+/* 一个账号的余额是若干积分包之和。包按来源命名（「国内运营裂变包」「拉新权益包」
+   「个人体验版」…），面额从 6 到 1500 不等，且**按次发放**。所以两个任务完成度
+   完全一致的账号，余额可能差上千——差别只在包里。这里把逐包明细摊开，并给每个
+   包名一个稳定配色，跨账号对比时同色即同类。 */
+
+const PK_COLORS = ['#4f8cff', '#25b08b', '#e8a33d', '#c96bd6', '#e2607a',
+                   '#5aa9e6', '#8fbf3f', '#b58b5a', '#7d8fa8', '#d4785c'];
+
+function pkColor(i) { return PK_COLORS[i % PK_COLORS.length]; }
+
+/* pkBySource 把包按名称归并，得到「来源 → 面额/余额/个数」。这是对比的关键视图：
+   两个号的差异一定体现在某几个来源的面额上。 */
+function pkBySource(packs) {
+  const m = new Map();
+  for (const p of packs) {
+    // 分组键用 code + name，而不是只 name：上游给「首登赠送」和普通活动包用了
+    // **同一个 PackageName 和同一个 PackageCode**，只按 name 会把两类混成一类，
+    // 那正是当初「两个号为何差 1500」看不出来的原因。这里至少把 code 带进键里，
+    // 并在卡片上显示最早的发放时间。
+    const k = (p.package_code || '') + '|' + (p.name || '(未命名)');
+    const e = m.get(k) || {
+      key: k, name: p.name || '(未命名)', code: p.package_code || '',
+      n: 0, remain: 0, size: 0, used: 0, minEnd: '', minCreated: '',
+    };
+    e.n += 1;
+    e.remain += Number(p.remain || 0);
+    e.size += Number(p.size || 0);
+    e.used += Number(p.used || 0);
+    const t = (p.end_time || '').slice(0, 10);
+    if (t && (!e.minEnd || t < e.minEnd)) e.minEnd = t;
+    const c = (p.created_at || '').slice(0, 10);
+    if (c && (!e.minCreated || c < e.minCreated)) e.minCreated = c;
+    m.set(k, e);
+  }
+  return [...m.values()].sort((a, b) => b.size - a.size);
+}
+
+function renderPackages(d) {
+  const list = (d.accounts || []);
+  if (!list.length) {
+    $('pkSummary').innerHTML = '<div class="empty">没有账号</div>';
+    return;
+  }
+
+  // 包名 → 稳定色号（跨账号一致，方便肉眼对齐）
+  const names = [];
+  for (const a of list) for (const s of pkBySource(a.packages || [])) {
+    if (!names.includes(s.key)) names.push(s.key);
+  }
+  names.sort((x, y) => {
+    const sz = n => Math.max(...list.map(a => {
+      const f = pkBySource(a.packages || []).find(s => s.key === n);
+      return f ? f.size : 0;
+    }));
+    return sz(y) - sz(x);
+  });
+  const colorOf = n => pkColor(names.indexOf(n));
+  // 键 → 展示名，供卡片与明细表共用（同一来源必然同色同名）。
+  const labelOf = {};
+  for (const a of list) for (const s of pkBySource(a.packages || [])) labelOf[s.key] = s;
+
+  const maxRemain = Math.max(1, ...list.map(a => Number(a.remain || 0)));
+
+  $('pkSummary').innerHTML = list.map(a => {
+    if (a.error) {
+      return '<div class="pk-card"><div class="who"><span class="nm">' +
+        esc((a.nickname || a.uid.slice(0, 8))) + '</span>' +
+        '<span class="realm">' + esc(a.realm || '') + '</span></div>' +
+        '<div class="err">查询失败：' + esc(a.error) + '</div></div>';
+    }
+    const srcs = pkBySource(a.packages || []);
+    const total = Math.max(1, Number(a.size || 0));
+    const bar = srcs.map(s =>
+      '<i style="width:' + (s.size / total * 100).toFixed(2) + '%;background:' +
+      colorOf(s.key) + '" title="' + esc(s.name) + ' ' + fmtTok(s.size) + '"></i>'
+    ).join('');
+    const legend = srcs.map(s =>
+      '<span><i style="background:' + colorOf(s.key) + '"></i>' +
+      esc(s.name.replace(/^CodeBuddy/, '')) + ' x' + s.n + ' · ' + fmtTok(s.size) +
+      (s.minCreated ? ' · 首发 ' + esc(s.minCreated.slice(5)) : '') + '</span>'
+    ).join('');
+    return '<div class="pk-card">' +
+      '<div class="who"><span class="nm">' + esc(a.nickname || a.uid.slice(0, 8)) + '</span>' +
+      '<span class="realm">' + esc(a.realm || '') + '</span></div>' +
+      '<div class="big">' + fmtTok(a.remain) + '</div>' +
+      '<div class="sub">共 ' + fmtTok(a.size) + ' · ' + (a.packages || []).length +
+      ' 个包 · 占最高 ' + (Number(a.remain || 0) / maxRemain * 100).toFixed(0) + '%</div>' +
+      '<div class="mixbar">' + bar + '</div>' +
+      '<div class="pk-legend">' + legend + '</div>' +
+      '</div>';
+  }).join('');
+
+  $('pkNote').textContent = list.length + ' 个账号 · 实时查询上游';
+
+  // 逐包明细：每个账号一个表，包的**面额**列是重点
+  $('pkDetail').innerHTML = list.map(a => {
+    if (a.error) return '';
+    const packs = (a.packages || []);
+    const rows = packs.map(p => {
+      const k = (p.package_code || '') + '|' + (p.name || '(未命名)');
+      const sub = (p.sub_product_code || '').replace(/^sp_tcaca_codebuddyide_?/, '') ||
+                  (p.package_code || '').replace(/^TCACA_/, '');
+      return '<tr><td class="mark" aria-hidden="true"><i style="background:' +
+        colorOf(k) + '"></i></td>' +
+      '<td>' + esc(p.name || '(未命名)') +
+        (sub ? '<div class="note">' + esc(sub) + '</div>' : '') + '</td>' +
+      '<td class="num">' + fmtTok(p.size) + '</td>' +
+      '<td class="num">' + fmtTok(p.remain) + '</td>' +
+      '<td class="num">' + fmtTok(p.used) + '</td>' +
+      '<td class="num">' + esc((p.created_at || '').slice(0, 16).replace('T', ' ') || '—') + '</td>' +
+      '<td class="num">' + esc((p.end_time || '').slice(0, 10) || '—') + '</td>' +
+      '</tr>';
+    }).join('');
+    return '<div class="box"><header><h3>' +
+      esc(a.nickname || a.uid.slice(0, 8)) + ' · ' + esc(a.realm || '') +
+      '</h3><span class="grow"></span><span class="note">余额 ' + fmtTok(a.remain) +
+      ' / 总额 ' + fmtTok(a.size) + ' · ' + packs.length + ' 个包（按面额降序）</span>' +
+      '</header><div class="tbl-wrap"><table class="acc"><thead><tr>' +
+      '<th class="mark" aria-hidden="true"></th><th>包名 / 来源</th>' +
+      '<th class="num">面额</th><th class="num">剩余</th><th class="num">已用</th>' +
+      '<th class="num">发放</th><th class="num">到期</th>' +
+      '</tr></thead><tbody>' + rows + '</tbody></table></div></div>';
+  }).join('');
+}
+
+async function loadPackages() {
+  $('pkSummary').innerHTML = '<div class="empty">查询中…（逐账号向上游实时查询）</div>';
+  $('pkDetail').innerHTML = '';
+  try {
+    const d = await api('packages');
+    renderPackages(d);
+  } catch (e) {
+    $('pkSummary').innerHTML = '<div class="empty">读取失败：' + esc(e.message) + '</div>';
+  }
+}
+
+if ($('btnPk')) $('btnPk').onclick = loadPackages;

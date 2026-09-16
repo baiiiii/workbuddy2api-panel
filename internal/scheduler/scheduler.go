@@ -29,6 +29,12 @@ type Config struct {
 	KeepaliveHours []int // 默认 [22]
 	BlackcatHours  []int // 默认 [23]：夜猫子（23:00–08:00 计数窗口）
 
+	// ExpiringSoonWindow 快过期积分窗口：签到/余额刷新查余额时，把到期时间
+	// <= now+window 的套餐余额标记为"快过期"（pool 据此优先消耗，见
+	// entry.creditsExpiring）。<=0 时禁用分桶（全部归长期，行为与引入前一致）。
+	// 默认建议 7*24h。
+	ExpiringSoonWindow time.Duration
+
 	// CheckinDisabled 显式关闭签到排程（对应 config 的 schedule.checkin_enabled=false）。
 	// 禁用后不再有任何签到时点。旅行不再搭签到便车（已剥离为独立排程）。
 	CheckinDisabled bool
@@ -260,6 +266,12 @@ func (s *Scheduler) RunCheckinNow() {
 		if a == nil || a.RefreshToken == "" {
 			continue
 		}
+		// D4 门控：realm=global 账号无签到体系，直接跳过（不发起任何上游调用，避免风控）。
+		// 经 auth.Realm() 统一判定：逃生门（global.enabled=false）下 global 账号被降级为 cn、
+		// 按 CN 处理——这是逃生门的刻意语义（纯 CN 部署锁死一切 global），与引用处一致。
+		if a.IsGlobal() {
+			continue
+		}
 		if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
 			// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
 			if upstream.IsAlreadyCheckin(err) {
@@ -269,12 +281,17 @@ func (s *Scheduler) RunCheckinNow() {
 			}
 			// 其余业务错误也继续走余额查询
 		}
-		remain, total, err := s.cfg.Upstream.UserResource(a)
+		// 分桶查余额：快过期窗口内的积分单独标记，pool 优先消耗。
+		// ExpiringSoonWindow<=0 时退化为纯总量（与引入前一致）。
+		remain, total, expiring, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
 		if err != nil {
 			log.Printf("user-resource %s: %v", st.UID, err)
 			continue
 		}
 		s.cfg.Pool.ReenableIfCredits(st.UID, remain, total)
+		if expiring > 0 {
+			s.cfg.Pool.SetCreditsDetailed(st.UID, remain, total, expiring)
+		}
 	}
 	s.RunStreakBonusNow()
 	s.RunSchoolNow() // 开学季活动（活动期 9/13-9/24，结束自动跳过）
@@ -294,6 +311,9 @@ func (s *Scheduler) RunActivityNow() {
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.AccessToken == "" {
 			continue
+		}
+		if a.IsGlobal() {
+			continue // D4 门控：global 无任务中心/活跃体系，不发起任何上游调用
 		}
 		if !first {
 			time.Sleep(activityAccountDelay)
@@ -376,12 +396,16 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 		wg.Add(1)
 		go func(a *auth.Auth, uid string) {
 			defer wg.Done()
-			remain, total, err := s.cfg.Upstream.UserResource(a)
+			remain, total, expiring, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
 			if err != nil {
 				log.Printf("balance %s: %v", uid, err)
 				return
 			}
-			s.cfg.Pool.ReenableIfCredits(uid, remain, total)
+			if expiring > 0 {
+				s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring)
+			} else {
+				s.cfg.Pool.ReenableIfCredits(uid, remain, total)
+			}
 		}(a, st.UID)
 	}
 	wg.Wait()

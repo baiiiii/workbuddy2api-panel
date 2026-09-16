@@ -28,7 +28,7 @@ func (c *Client) schoolJSON(a *auth.Auth, method, path string, body map[string]a
 	if body != nil {
 		raw, _ = json.Marshal(body)
 	}
-	req, err := http.NewRequest(method, c.BillingBaseCN+schoolBase+path, bytes.NewReader(raw))
+	req, err := http.NewRequest(method, c.billingBase(a)+schoolBase+path, bytes.NewReader(raw))
 	if err != nil {
 		return err
 	}
@@ -132,20 +132,20 @@ const mpReportPath = "/v2/report"
 // mpEventBase 小程序埋点公共指纹（appservice wQ()+Ao() 对齐）。
 func mpEventBase(a *auth.Auth) map[string]any {
 	return map[string]any{
-		"timestamp":   time.Now().UnixMilli(),
-		"ideType":     "WorkBuddy_MP",
-		"ideVersion":  "2.4.0",
-		"extName":     "workbuddy-mp",
-		"extVersion":  "2.4.0",
-		"product":     "SaaS",
-		"ideName":     "wx_app_cloud",
-		"platform":    "mini_program",
-		"os":          "windows",
-		"osVersion":   "11",
-		"arch":        "x64",
-		"machineId":   "0655736a-607f-4d9d-b430-58176ee9a090",
-		"timezone":  "Asia/Shanghai",
-		"userId":      a.UID,
+		"timestamp":    time.Now().UnixMilli(),
+		"ideType":      "WorkBuddy_MP",
+		"ideVersion":   "2.4.0",
+		"extName":      "workbuddy-mp",
+		"extVersion":   "2.4.0",
+		"product":      "SaaS",
+		"ideName":      "wx_app_cloud",
+		"platform":     "mini_program",
+		"os":           "windows",
+		"osVersion":    "11",
+		"arch":         "x64",
+		"machineId":    "0655736a-607f-4d9d-b430-58176ee9a090",
+		"timezone":     "Asia/Shanghai",
+		"userId":       a.UID,
 		"userNickname": a.Nickname,
 	}
 }
@@ -193,7 +193,7 @@ func (c *Client) ReportMPEvent(a *auth.Auth, events ...map[string]any) error {
 func SchoolChatTimesEvents(conversationID string) map[string]any {
 	rid := "wb2api-" + clientToken()
 	return map[string]any{
-		"eventCode": "chat_request_send",
+		"eventCode":   "chat_request_send",
 		"inputLength": 14, "isPlan": false, "isAutoExecuteTerminal": false,
 		"isAutoModify": false, "codebaseEnable": false, "maxToken": 0,
 		"maxSteps": 500, "temperature": 0, "maxRetries": 0,
@@ -228,7 +228,7 @@ func SchoolExpertUseEvents(expertID, expertName, conversationID string) []map[st
 			"characterCount": 14, "expertType": "builtin",
 		},
 		{
-			"eventCode": "chat_request_send",
+			"eventCode":   "chat_request_send",
 			"inputLength": 14, "isPlan": false, "isAutoExecuteTerminal": false,
 			"isAutoModify": false, "codebaseEnable": false, "maxToken": 0,
 			"maxSteps": 500, "temperature": 0, "maxRetries": 0,
@@ -244,4 +244,31 @@ func SchoolExpertUseEvents(expertID, expertName, conversationID string) []map[st
 			"codebuddy.conversation_request_id": rid,
 		},
 	}
+}
+
+// ---- 我的券码（#/prizes?tab=vouchers，2026-09-16 接入）----
+
+// SchoolVoucher 开学季抽奖抽中的第三方券（KFC/瑞幸/酷狗等）。
+// 字段结构按真实响应样本：GET /vouchers 单次拉全（无分页），data.items[]。
+type SchoolVoucher struct {
+	GrantID   int64  `json:"grant_id"`
+	DrawUUID  string `json:"draw_uuid,omitempty"`
+	SKUCode   string `json:"sku_code,omitempty"`   // kfc_ice_cream / voucher_luckin / voucher_kugou …
+	PrizeName string `json:"prize_name,omitempty"` // 肯德基冰淇淋
+	Code      string `json:"code"`                 // 券码本体（复制给店员核销）
+	ValidFrom string `json:"valid_from,omitempty"` // 上游常为空
+	ValidTo   string `json:"valid_to,omitempty"`   // "2026-10-24"
+	GrantedAt string `json:"granted_at,omitempty"` // RFC3339
+}
+
+// SchoolVouchers 查询账号的开学季券码列表（只读）。
+// 抽到积分的记录不在此端点（那是 /rewards 的 type=credit 条目）。
+func (c *Client) SchoolVouchers(a *auth.Auth) ([]SchoolVoucher, error) {
+	var out struct {
+		Items []SchoolVoucher `json:"items"`
+	}
+	if err := c.schoolJSON(a, http.MethodGet, "/vouchers", nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Items, nil
 }

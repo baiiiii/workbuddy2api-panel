@@ -13,9 +13,7 @@ func (p *Pool) Disable(uid, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
-		e.disabled = true
-		e.reason = reason
-		p.dirty.Store(true)
+		p.disableLocked(e, reason)
 	}
 }
 
@@ -39,10 +37,8 @@ func (p *Pool) NoteSessionDead(uid string) bool {
 	if e.sessionDeadFails < sessionDeadThreshold {
 		return false
 	}
-	e.disabled = true
-	e.reason = sessionDeadReason
 	e.sessionDeadFails = 0
-	p.dirty.Store(true)
+	p.disableLocked(e, sessionDeadReason)
 	return true
 }
 
@@ -87,7 +83,7 @@ func (p *Pool) Revive(uid string) bool {
 	e.coolKind = 0
 	e.reason = ""
 	e.softStreak = 0
-	e.softRateModel = "" // 模型级限流豁免随冷却一并清（防泄漏到后续账号级限流）
+	e.modelCooldowns = nil // 模型级限流豁免随冷却一并清（防泄漏到后续账号级限流）
 	e.sessionDeadFails = 0
 	e.fails = 0
 	e.retryCount = 0
@@ -133,6 +129,9 @@ func (p *Pool) NoteError(uid string) {
 // 二进制模型：清 fails + retryCount + breakerUntil；不碰 until/coolKind（那些是即时冷却，各自到期）。
 // 额外清 softStreak：成功是账号已恢复的最强证据，连续软限流计数就此归零、退避回到基数。
 // 同样清 sessionDeadFails：成功证明 session 未死（与 ClearSessionDead 语义一致）。
+// **不碰 modelCooldowns**：6004 模型级 limit 每模型独立计时，其他模型成功不得抹掉
+// 本模型的冷却截止（这正是"每模型独立"的语义）。模型级冷却只由到期/复活/账号级
+// 冷却（Cooldown/reviveCoolingLocked）清除。
 func (p *Pool) NoteSuccess(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -146,6 +145,50 @@ func (p *Pool) NoteSuccess(uid string) {
 		e.sessionDeadFails = 0
 		p.dirty.Store(true)
 	}
+}
+
+// RecordTokenUsage 记录一次实际发起的聊天账号尝试及上游返回的 usage 增量。
+// usage 字段缺失时仍累计请求次数，但只累计明确存在的 token 字段。
+func (p *Pool) RecordTokenUsage(uid string, delta TokenUsageDelta) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+	usage := &e.tokenUsage
+	usage.RequestCount++
+	usage.LastUsedAt = time.Now()
+	if delta.Model != "" {
+		usage.LastModel = delta.Model
+	}
+	known := false
+	if delta.HasPromptTokens && delta.PromptTokens >= 0 {
+		usage.PromptTokens += delta.PromptTokens
+		known = true
+	}
+	if delta.HasCompletionTokens && delta.CompletionTokens >= 0 {
+		usage.CompletionTokens += delta.CompletionTokens
+		known = true
+	}
+	if delta.HasTotalTokens && delta.TotalTokens >= 0 {
+		usage.TotalTokens += delta.TotalTokens
+		known = true
+	}
+	if known {
+		usage.UsageCount++
+	}
+	if delta.HasLatencyMs && delta.LatencyMs >= 0 {
+		usage.LastLatencyMs = delta.LatencyMs
+	}
+	if delta.HasTokensPerSecond && delta.TokensPerSecond >= 0 {
+		speed := delta.TokensPerSecond
+		usage.LastTokensPerSecond = &speed
+	} else {
+		// 失败或缺少 completion_tokens 时不展示上一次请求的旧吞吐速度。
+		usage.LastTokensPerSecond = nil
+	}
+	p.dirty.Store(true)
 }
 
 // Status 查询单账号状态。
@@ -258,10 +301,24 @@ func (p *Pool) PickByUID(uid string) *auth.Auth {
 // inFlightFull 是 healthy 的子集——healthy 里已达在途上限的账号数，供 /status 透出满载度。
 // 与 ServableNow 的区别见该函数注释。
 func (p *Pool) CountsDetailed() (total, healthy, cooling, disabled, inFlightFull int) {
+	return p.countsDetailedForRealm("")
+}
+
+// CountsDetailedForRealm 同 CountsDetailed，但仅统计 Realm()==realm 的账号；
+// realm=="" 不加谓词（= CountsDetailed）。供 /status 按域分组透出。
+func (p *Pool) CountsDetailedForRealm(realm string) (total, healthy, cooling, disabled, inFlightFull int) {
+	return p.countsDetailedForRealm(realm)
+}
+
+// countsDetailedForRealm 是两函数共用的遍历实现；realm=="" 不加谓词。
+func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, disabled, inFlightFull int) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
 	for _, e := range p.byUID {
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
 		total++
 		switch {
 		case e.disabled:
@@ -283,10 +340,20 @@ func (p *Pool) CountsDetailed() (total, healthy, cooling, disabled, inFlightFull
 // 不看 inFlight；ServableNow 额外叠加在途维度，与 chat 的真实可达性（Pick 会跳过 inFlightFull 账号）对齐。
 // 专供 /healthz 用，避免"全账号 healthy 但都占满"时探活误报 200 而 chat 返回 503 的口径裂缝。
 func (p *Pool) ServableNow() bool {
+	return p.ServableForRealm("")
+}
+
+// ServableForRealm 报告某 realm 是否可服务：存在至少一个该 realm 的 healthy 且未占满在途名额的账号。
+// 与 ServableNow 同口径（healthy 或模型豁免、排除 inFlightFull），仅叠加 Realm()==realm 谓词。
+// realm=="" 退化为 ServableNow（现状语义）。供 /healthz 按 realm 暴露 CN/global 各自可达性。
+func (p *Pool) ServableForRealm(realm string) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
 	for _, e := range p.byUID {
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
 		if p.inFlightFull(e) {
 			continue
 		}
@@ -318,22 +385,29 @@ func (p *Pool) List() []Status {
 func (p *Pool) statusOf(uid string, e *entry) Status {
 	now := time.Now()
 	st := Status{
-		UID:             uid,
-		Nickname:        e.a.Nickname,
-		Credits:         e.credits,
-		CreditsTotal:    e.creditsTotal,
-		Cooling:         now.Before(e.until) || now.Before(e.breakerUntil),
-		Reason:          e.reason,
-		Disabled:        e.disabled,
-		SuccessCount:    e.successCount,
-		ErrTotal:        e.errTotal,
-		LastSuccessTime: e.lastSuccess,
-		LastErrTime:     e.lastErr,
-		Until:           e.until,
-		SoftStreak:      e.softStreak,
-		InFlight:        int(e.inFlight.Load()),
-		BreakerFails:    e.fails,
-		BreakerUntil:    e.breakerUntil,
+		UID: uid,
+		// 限额台账（issue #36）：仅「带解析时间 6004 的模型级软冷却」仍在生效时非空，
+		// 每模型一行（modelCooldowns 内未到期的条目），多模型同时限流全部展示。
+		// 到期判据 = 该模型的独立冷却 until 未过；条件满足才输出，随到期自然消失，
+		// 普通软冷却（无模型级表）/硬冷却不产生台账（零回归）。
+		RateLimitedModels: p.rateLimitedModelsLocked(e, now),
+		Realm:             e.a.Realm(),
+		Nickname:          e.a.Nickname,
+		Credits:           e.credits,
+		CreditsTotal:      e.creditsTotal,
+		Cooling:           now.Before(e.until) || now.Before(e.breakerUntil),
+		Reason:            e.reason,
+		Disabled:          e.disabled,
+		SuccessCount:      e.successCount,
+		ErrTotal:          e.errTotal,
+		TokenUsage:        e.tokenUsage,
+		LastSuccessTime:   e.lastSuccess,
+		LastErrTime:       e.lastErr,
+		Until:             e.until,
+		SoftStreak:        e.softStreak,
+		InFlight:          int(e.inFlight.Load()),
+		BreakerFails:      e.fails,
+		BreakerUntil:      e.breakerUntil,
 	}
 	if st.Disabled {
 		// 禁用账号透出禁用原因（运维看不到为什么死）。
@@ -353,3 +427,38 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 // ---------------------------------------------------------------------------
 // 持久化
 // ---------------------------------------------------------------------------
+
+// rateLimitedModelsLocked 收集账号当前仍在限额的模型台账行（issue #36）。
+// modelCooldowns 未到期条目按模型名稳定排序输出；全部到期/空表返回 nil。
+// 调用方必须已持有锁（statusOf 只读路径持 RLock，本函数只读不写）。
+func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedModel {
+	if len(e.modelCooldowns) == 0 {
+		return nil
+	}
+	// 先排序模型名，保证输出稳定（map 遍历无序）。
+	models := make([]string, 0, len(e.modelCooldowns))
+	for m := range e.modelCooldowns {
+		models = append(models, m)
+	}
+	sort.Strings(models)
+	rows := make([]RateLimitedModel, 0, len(models))
+	for _, m := range models {
+		mc := e.modelCooldowns[m]
+		if !mc.Until.IsZero() && now.Before(mc.Until) {
+			row := RateLimitedModel{
+				Model:  m,
+				Until:  mc.Until,
+				Reason: mc.Reason,
+			}
+			// 上游原始重置墙钟：截断后 until==resetAt 时省略（omitempty），台账只显示真实恢复时刻。
+			if !mc.ResetAt.IsZero() && !mc.ResetAt.Equal(mc.Until) {
+				row.ResetAt = mc.ResetAt
+			}
+			rows = append(rows, row)
+		}
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	return rows
+}

@@ -37,13 +37,13 @@ type schoolTaskView struct {
 
 // scanAccountItem 单账号扫描结果。
 type scanAccountItem struct {
-	UID      string           `json:"uid"`
-	Nickname string           `json:"nickname"`
-	Growth   []upstream.Task  `json:"growth,omitempty"`
-	GrowthErr string          `json:"growth_error,omitempty"`
-	School   []schoolTaskView `json:"school,omitempty"`
-	SchoolErr string          `json:"school_error,omitempty"`
-	InPeriod bool             `json:"in_period"`
+	UID       string           `json:"uid"`
+	Nickname  string           `json:"nickname"`
+	Growth    []upstream.Task  `json:"growth,omitempty"`
+	GrowthErr string           `json:"growth_error,omitempty"`
+	School    []schoolTaskView `json:"school,omitempty"`
+	SchoolErr string           `json:"school_error,omitempty"`
+	InPeriod  bool             `json:"in_period"`
 }
 
 // growthPending 任务是否"未完成且可自动化"。
@@ -88,6 +88,10 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 			}
 			it := &items[i]
 			it.UID, it.Nickname = uid, a.Nickname
+			// D4 门控：global 账号无 CN 成长/开学季任务体系，不发起任何上游调用。
+			if a.IsGlobal() {
+				return
+			}
 			if tasks, err := p.cfg.Upstream.ListTasks(a); err != nil {
 				it.GrowthErr = err.Error()
 			} else {
@@ -202,6 +206,10 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 		go func(a *auth.Auth, wantSchool bool) {
 			defer wg.Done()
 			one := queueAccount{a: a}
+			// D4 门控：global 账号无 CN 成长/开学季任务体系，不发起任何上游调用。
+			if a.IsGlobal() {
+				return
+			}
 			if body.Growth {
 				if tasks, err := p.cfg.Upstream.ListTasks(a); err == nil {
 					for _, t := range tasks {
@@ -441,13 +449,13 @@ func (p *Panel) tasksQueueStatus(w http.ResponseWriter, r *http.Request) {
 	items := make([]queueItem, len(q.items))
 	copy(items, q.items)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"running":   q.running,
-		"total":     len(items),
-		"conc":      q.conc,
-		"started":   !q.startedAt.IsZero(),
+		"running":    q.running,
+		"total":      len(items),
+		"conc":       q.conc,
+		"started":    !q.startedAt.IsZero(),
 		"started_at": q.startedAt,
-		"seq":       q.seq,
-		"items":     items,
+		"seq":        q.seq,
+		"items":      items,
 	})
 }
 
@@ -481,6 +489,14 @@ func (p *Panel) schoolStatus(w http.ResponseWriter, r *http.Request) {
 		go func(a *auth.Auth) {
 			defer wg.Done()
 			v := acctView{UID: a.UID, Nickname: a.Nickname}
+			// D4 门控：global 账号无开学季活动，不发起任何上游调用。
+			if a.IsGlobal() {
+				v.Err = "global realm（无开学季活动）"
+				mu.Lock()
+				out = append(out, v)
+				mu.Unlock()
+				return
+			}
 			tasks, inPeriod, err := p.cfg.Upstream.SchoolTasks(a)
 			if err != nil {
 				v.Err = err.Error()
@@ -512,4 +528,55 @@ func (p *Panel) schoolRunAll(w http.ResponseWriter, r *http.Request) {
 	go p.cfg.Scheduler.RunSchoolNow()
 	log.Printf("panel: 开学季全账号闭环已触发")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+}
+
+// schoolVouchers 我的券码：逐 CN 账号查开学季 /vouchers（3 并发，与 packages
+// 同款限流），失败只在对应账号标 error。global 账号无开学季，不发上游调用。
+func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
+	accts := p.cfg.Pool.List()
+	type row struct {
+		UID      string                   `json:"uid"`
+		Nickname string                   `json:"nickname"`
+		Vouchers []upstream.SchoolVoucher `json:"vouchers"`
+		Err      string                   `json:"error,omitempty"`
+	}
+	out := make([]row, len(accts))
+	sem := make(chan struct{}, 3)
+	var wg sync.WaitGroup
+	for i, st := range accts {
+		if st.Disabled {
+			continue // 未占位，行末统一压掉
+		}
+		a := p.cfg.Pool.AuthByUID(st.UID)
+		if a == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(i int, a *auth.Auth) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			it := row{UID: a.UID, Nickname: a.Nickname}
+			switch {
+			case a.IsGlobal():
+				it.Err = "global realm（无开学季活动）"
+			default:
+				vs, err := p.cfg.Upstream.SchoolVouchers(a)
+				if err != nil {
+					it.Err = err.Error()
+				} else {
+					it.Vouchers = vs
+				}
+			}
+			out[i] = it
+		}(i, a)
+	}
+	wg.Wait()
+	res := make([]row, 0, len(out))
+	for _, it := range out {
+		if it.UID != "" {
+			res = append(res, it)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"accounts": res})
 }

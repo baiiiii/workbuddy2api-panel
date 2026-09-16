@@ -168,6 +168,9 @@ func TestChatOversizedBodyReturns413(t *testing.T) {
 	if st.Cooling || st.Disabled || st.ErrTotal != 0 {
 		t.Errorf("413 must not penalize account: %+v", st)
 	}
+	if st.TokenUsage.RequestCount != 0 {
+		t.Errorf("413 must not record token usage: %+v", st.TokenUsage)
+	}
 }
 
 // TestChatOversizedBodyDefaultLimitHeader 未显式设置 MaxBodyBytes 时兜底 8MB：
@@ -190,6 +193,47 @@ func TestChatOversizedBodyDefaultLimit(t *testing.T) {
 	}
 	if calls != 0 {
 		t.Errorf("upstream must not be called, got %d", calls)
+	}
+}
+
+// TestSetMaxBodyBytesHotApply 面板在线改 server.max_body_mb 必须即时生效（issue #17：
+// 改了配置却静默不生效，用户仍被旧上限 413）。同一请求体：调小后 413、调大后放行，
+// 全程不重建 handler。另覆盖 setter 的 <=0 兜底（回落 8MB）。
+func TestSetMaxBodyBytesHotApply(t *testing.T) {
+	var calls int
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls++
+		return 200, sseOK, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, MaxBodyBytes: 100})
+
+	// 尾部空格不影响 JSON 合法性，只把请求体撑过 100 字节。
+	body := []byte(`{"model":"glm-5.2","messages":[]}` + strings.Repeat(" ", 128))
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body)))
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("code=%d want 413 (body 228B > limit 100B)", rec.Code)
+	}
+
+	h.SetMaxBodyBytes(4096) // 面板保存路径的热更新
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d want 200 after enlarge (limit 4096B)", rec.Code)
+	}
+	if calls != 1 {
+		t.Errorf("upstream calls = %d, want 1（放行后应恰好打一次）", calls)
+	}
+
+	// <=0 兜底回落 8MB：8MB+1 仍拒，8MB-1 放行。
+	h.SetMaxBodyBytes(0)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		bytes.NewReader(append(body, make([]byte, 8<<20)...))))
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("code=%d want 413 (fallback 8MB, body > 8MB)", rec.Code)
 	}
 }
 
@@ -275,6 +319,17 @@ func TestChatNonStreamAggregates(t *testing.T) {
 	if msg["content"] != "你好" {
 		t.Errorf("content=%q", msg["content"])
 	}
+	st, ok := h.cfg.Pool.Status("u1")
+	if !ok {
+		t.Fatal("account status missing")
+	}
+	if st.TokenUsage.RequestCount != 1 || st.TokenUsage.UsageCount != 1 ||
+		st.TokenUsage.PromptTokens != 1 || st.TokenUsage.CompletionTokens != 1 || st.TokenUsage.TotalTokens != 2 {
+		t.Errorf("token usage=%+v", st.TokenUsage)
+	}
+	if st.TokenUsage.LastLatencyMs < 1 || st.TokenUsage.LastTokensPerSecond == nil || *st.TokenUsage.LastTokensPerSecond <= 0 {
+		t.Errorf("latest performance=%+v", st.TokenUsage)
+	}
 }
 
 func TestChatStreamPassthrough(t *testing.T) {
@@ -297,6 +352,17 @@ func TestChatStreamPassthrough(t *testing.T) {
 	body := rec.Body.String()
 	if !strings.Contains(body, "你好") || !strings.Contains(body, "data: [DONE]") {
 		t.Errorf("body=%q", body)
+	}
+	st, ok := h.cfg.Pool.Status("u1")
+	if !ok {
+		t.Fatal("account status missing")
+	}
+	if st.TokenUsage.RequestCount != 1 || st.TokenUsage.UsageCount != 1 ||
+		st.TokenUsage.PromptTokens != 1 || st.TokenUsage.CompletionTokens != 1 || st.TokenUsage.TotalTokens != 2 {
+		t.Errorf("token usage=%+v", st.TokenUsage)
+	}
+	if st.TokenUsage.LastLatencyMs < 1 || st.TokenUsage.LastTokensPerSecond == nil || *st.TokenUsage.LastTokensPerSecond <= 0 {
+		t.Errorf("latest performance=%+v", st.TokenUsage)
 	}
 }
 
@@ -329,6 +395,13 @@ func TestChatRotatesOnHardCredit(t *testing.T) {
 	st, _ := p.Status("bad")
 	if !st.Cooling || st.Reason == "" {
 		t.Errorf("bad account should be cooling: %+v", st)
+	}
+	if st.TokenUsage.RequestCount != 1 || st.TokenUsage.UsageCount != 0 {
+		t.Errorf("bad token usage=%+v", st.TokenUsage)
+	}
+	good, _ := p.Status("good")
+	if good.TokenUsage.RequestCount != 1 || good.TokenUsage.TotalTokens != 2 {
+		t.Errorf("good token usage=%+v", good.TokenUsage)
 	}
 }
 
@@ -652,13 +725,16 @@ func TestChat6004ModelResetCoolsToParsedTime(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s (want 200 after rotate to good)", rec.Code, rec.Body)
 	}
-	// bad 已进入 soft 冷却，until ≈ reset。
+	// bad 已进入 6004 模型级独立冷却：账号级不 cooling，台账单行 until ≈ reset。
 	st, _ := p.Status("bad")
-	if !st.Cooling || st.CoolKind != "soft_rate" {
-		t.Fatalf("bad should be soft cooling from 6004: %+v", st)
+	if st.Cooling {
+		t.Fatalf("6004-with-reset should NOT set account-level cooling: %+v", st)
 	}
-	if d := st.Until.Sub(reset); d < -time.Second || d > time.Second {
-		t.Errorf("until=%v want ~reset=%v (diff %v)", st.Until, reset, d)
+	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.3" {
+		t.Fatalf("want single model ledger row glm-5.3: %+v", st.RateLimitedModels)
+	}
+	if d := st.RateLimitedModels[0].Until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("model until=%v want ~reset=%v (diff %v)", st.RateLimitedModels[0].Until, reset, d)
 	}
 	// 记录触发模型（bad 池内 private 字段需经 Status 不可见，改用行为断言）：
 	// 同模型 glm-5.3 的请求不应选中 bad（仍冷却）；
@@ -824,12 +900,12 @@ func TestModelsEndpoint(t *testing.T) {
 	}
 	found := false
 	for _, m := range data {
-		if m.(map[string]any)["id"] == "glm-5.2" {
+		if m.(map[string]any)["id"] == "cn:glm-5.2" {
 			found = true
 		}
 	}
 	if !found {
-		t.Error("glm-5.2 missing")
+		t.Error("cn:glm-5.2 missing")
 	}
 }
 
@@ -862,7 +938,7 @@ func TestModelsDynamic(t *testing.T) {
 	for _, m := range data {
 		ids[m.(map[string]any)["id"].(string)] = true
 	}
-	if !ids["dyn-model-a"] || !ids["glm-9.9"] {
+	if !ids["cn:dyn-model-a"] || !ids["cn:glm-9.9"] {
 		t.Errorf("dynamic ids missing: %v", ids)
 	}
 
@@ -1386,7 +1462,8 @@ func TestContentBlockedStickyDegraded(t *testing.T) {
 }
 
 // TestContentBlockedCustomModeDoesNotDegrade custom 模式不触发降级重试
-// （custom 已用自有提示词替换，不应再有 system 来源误报；若仍 400 走既有错误路径）。
+// （custom 已用自有提示词替换，不应再有 system 来源误报）；仍拦则直接回
+// 400 content_blocked 防火墙文案（不轮转、不暴露账号/上游错误码）。
 func TestContentBlockedCustomModeDoesNotDegrade(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 400, `{"code":11128,"msg":"blocked by security policy"}`, false
@@ -1397,9 +1474,24 @@ func TestContentBlockedCustomModeDoesNotDegrade(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"system","content":"old"},{"role":"user","content":"hi"}]}`)))
-	// custom 模式下 400 直接返回 503（所有账号轮转失败），不降级重试。
-	if rec.Code != 503 {
-		t.Fatalf("code=%d want 503 (custom does not degrade)", rec.Code)
+	// custom 模式下仍拦 → 400 content_blocked（内容终态，换号无意义），不降级重试。
+	if rec.Code != 400 {
+		t.Fatalf("code=%d want 400 content_blocked (custom does not degrade)", rec.Code)
+	}
+	var env struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("unmarshal: %v (body=%s)", err, rec.Body.String())
+	}
+	if env.Error.Code != "content_blocked" {
+		t.Errorf("error.code=%q want content_blocked", env.Error.Code)
+	}
+	// 防火墙文案不得泄露上游 code 11128。
+	if strings.Contains(rec.Body.String(), "11128") {
+		t.Errorf("client body leaks upstream code 11128: %s", rec.Body.String())
 	}
 	if h.degrade.Active() {
 		t.Error("degrade should NOT be active in custom mode")
